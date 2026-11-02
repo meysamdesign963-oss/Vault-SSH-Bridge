@@ -8,4 +8,5 @@ export { VaultFS, VaultError } from './vaultfs';
 export { generateHostKeys, hostKeyFingerprint } from './hostkeys';
 export { DEFAULT_SETTINGS, DEFAULT_RULES_TEXT } from './types';
 export { ShellSession, PLUGIN_VERSION } from './shell';
+export { lanIPv4s, bestLanIPv4, parseTunnelEndpoint, buildTunnelSpec } from './netinfo';
 export type { VaultSSHSettings } from './types';

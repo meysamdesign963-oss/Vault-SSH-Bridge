@@ -4,6 +4,9 @@
 
 export type DeleteMode = 'trash' | 'permanent';
 
+/** Public tunnel service used to expose the server to the internet. */
+export type TunnelMode = 'off' | 'pinggy' | 'serveo' | 'custom';
+
 export interface VaultSSHSettings {
   /** Start the SSH server automatically when Obsidian loads. */
   startWithObsidian: boolean;
@@ -35,6 +38,16 @@ export interface VaultSSHSettings {
   protectedPaths: string;
   /** Mirror activity log to the developer console. */
   logToConsole: boolean;
+  /** Public tunnel service for internet access (external AI assistants). */
+  tunnelMode: TunnelMode;
+  /** Custom ssh command template for tunnelMode === 'custom' ({PORT} = local port). */
+  tunnelCustom: string;
+  /** Temporarily ban IPs after repeated failed logins. */
+  bruteforceProtect: boolean;
+  /** Failed attempts (per IP, 10 min window) before a ban. */
+  maxAuthFails: number;
+  /** Ban duration in minutes. */
+  banMinutes: number;
 }
 
 export const DEFAULT_RULES_TEXT = [
@@ -63,6 +76,11 @@ export const DEFAULT_SETTINGS: VaultSSHSettings = {
   showHidden: false,
   protectedPaths: '.obsidian',
   logToConsole: true,
+  tunnelMode: 'off',
+  tunnelCustom: '',
+  bruteforceProtect: true,
+  maxAuthFails: 5,
+  banMinutes: 10,
 };
 
 export interface LogEntry {

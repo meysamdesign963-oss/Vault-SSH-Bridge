@@ -12,7 +12,7 @@ import { StringDecoder } from 'string_decoder';
 import { VaultSSHSettings } from './types';
 import { VaultFS, VaultError, fmtBytes, fmtDate } from './vaultfs';
 
-export const PLUGIN_VERSION = '1.0.0';
+export const PLUGIN_VERSION = '1.1.0';
 
 export interface ShellIO {
   write(s: string): void;

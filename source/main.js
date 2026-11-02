@@ -7773,7 +7773,7 @@ var require_agent = __commonJS({
     var { Duplex } = require("stream");
     var { resolve } = require("path");
     var { readFile } = require("fs");
-    var { execFile, spawn } = require("child_process");
+    var { execFile, spawn: spawn2 } = require("child_process");
     var { isParsedKey, parseKey } = require_keyParser();
     var {
       makeBufferParser,
@@ -7950,7 +7950,7 @@ var require_agent = __commonJS({
             return cb(new Error("Unexpected multiple agent requests"));
           this.buffer = null;
           let error;
-          const proc = this.proc = spawn(EXEPATH, [data.length]);
+          const proc = this.proc = spawn2(EXEPATH, [data.length]);
           proc.stdout.on("data", (data2) => {
             this.push(data2);
           });
@@ -20169,7 +20169,12 @@ var DEFAULT_SETTINGS = {
   maxReadBytes: 512 * 1024,
   showHidden: false,
   protectedPaths: ".obsidian",
-  logToConsole: true
+  logToConsole: true,
+  tunnelMode: "off",
+  tunnelCustom: "",
+  bruteforceProtect: true,
+  maxAuthFails: 5,
+  banMinutes: 10
 };
 
 // src/vaultfs.ts
@@ -20565,7 +20570,7 @@ var import_ssh2 = __toESM(require_lib2());
 
 // src/shell.ts
 var import_string_decoder = require("string_decoder");
-var PLUGIN_VERSION = "1.0.0";
+var PLUGIN_VERSION = "1.1.0";
 var HELP_TEXT = [
   "Available commands:",
   "  info                          vault info (name, note count)",
@@ -21053,6 +21058,11 @@ var VaultSSHServer = class {
     this.server = null;
     this.sessions = /* @__PURE__ */ new Map();
     this.nextId = 1;
+    /** failed-login tracking per IP (10 min sliding window). */
+    this.failCounts = /* @__PURE__ */ new Map();
+    /** banned IPs (value = ban expiry epoch ms). */
+    this.banUntil = /* @__PURE__ */ new Map();
+    this.nextSweep = 0;
   }
   isRunning() {
     return !!this.server;
@@ -21149,6 +21159,59 @@ var VaultSSHServer = class {
     }
     return n;
   }
+  /** Number of currently banned IPs (for the status UI). */
+  get banCount() {
+    return this.banUntil.size;
+  }
+  /* ---------------- brute-force guard ---------------- */
+  sweepGuards(now) {
+    if (now < this.nextSweep) return;
+    this.nextSweep = now + 3e4;
+    for (const [ip, until] of this.banUntil) {
+      if (until <= now) this.banUntil.delete(ip);
+    }
+    for (const [ip, rec] of this.failCounts) {
+      if (now - rec.first > 10 * 6e4) this.failCounts.delete(ip);
+    }
+  }
+  banRemainingMs(ip) {
+    const until = this.banUntil.get(ip) ?? 0;
+    return until > Date.now() ? until - Date.now() : 0;
+  }
+  noteAuthFail(ip) {
+    const s = this.getSettings();
+    if (!s.bruteforceProtect) return;
+    const now = Date.now();
+    this.sweepGuards(now);
+    const rec = this.failCounts.get(ip) ?? { count: 0, first: now };
+    if (now - rec.first > 10 * 6e4) {
+      rec.count = 0;
+      rec.first = now;
+    }
+    rec.count++;
+    this.failCounts.set(ip, rec);
+    const threshold = Math.max(2, s.maxAuthFails);
+    if (rec.count >= threshold) {
+      const mins = Math.max(1, s.banMinutes);
+      this.banUntil.set(ip, now + mins * 6e4);
+      this.failCounts.delete(ip);
+      this.hooks.log(`brute-force guard: ${ip} banned for ${mins} min (${rec.count} failed logins)`);
+      this.hooks.notify(`IP ${ip} \u0628\u0647 \u0645\u062F\u062A ${mins} \u062F\u0642\u06CC\u0642\u0647 \u0645\u0633\u062F\u0648\u062F \u0634\u062F (${rec.count} \u062A\u0644\u0627\u0634 \u0646\u0627\u0645\u0648\u0641\u0642 \u0648\u0631\u0648\u062F).`);
+    }
+  }
+  /** IPs currently banned (ip -> remaining ms) for display. */
+  listBans() {
+    const now = Date.now();
+    this.sweepGuards(now);
+    return [...this.banUntil.entries()].filter(([, until]) => until > now).map(([ip, until]) => ({ ip, remainingMs: until - now })).sort((a, b) => b.remainingMs - a.remainingMs);
+  }
+  clearBans() {
+    const n = this.banUntil.size;
+    this.banUntil.clear();
+    this.failCounts.clear();
+    if (n > 0) this.hooks.log(`all bans cleared (${n})`);
+    return n;
+  }
   /* ---------------- internals ---------------- */
   register(kind, ip, conn) {
     const id = this.nextId++;
@@ -21175,6 +21238,16 @@ var VaultSSHServer = class {
   onClient(client) {
     const ip = client._sock?.remoteAddress || "unknown";
     let attempts = 0;
+    this.sweepGuards(Date.now());
+    const bannedFor = this.banRemainingMs(ip);
+    if (bannedFor > 0) {
+      this.hooks.log(`connection from banned ${ip} \u2014 dropped (${Math.ceil(bannedFor / 1e3)}s left)`);
+      try {
+        client.end();
+      } catch {
+      }
+      return;
+    }
     this.hooks.log(`connection from ${ip}`);
     client.on("authentication", (ctx) => {
       const s = this.getSettings();
@@ -21185,6 +21258,7 @@ var VaultSSHServer = class {
       };
       if (authMethod === "password") {
         if (check(String(ctx.password ?? ""))) {
+          this.failCounts.delete(ip);
           this.hooks.log(`auth ok: ${ctx.username}@${ip}`);
           ctx.accept();
         } else {
@@ -21195,6 +21269,7 @@ var VaultSSHServer = class {
           const first = Array.isArray(answers) ? answers?.[0] : void 0;
           const pass = typeof first === "object" && first !== null ? String(first.response ?? "") : String(first ?? "");
           if (check(pass)) {
+            this.failCounts.delete(ip);
             this.hooks.log(`auth ok (keyboard-interactive): ${ctx.username}@${ip}`);
             ctx.accept();
           } else {
@@ -21253,6 +21328,7 @@ var VaultSSHServer = class {
   failAuth(ctx, client, ip, attempt) {
     const n = attempt + 1;
     this.hooks.log(`auth failed (${n}): ${ctx.username ?? "?"}@${ip}`);
+    this.noteAuthFail(ip);
     try {
       ctx.reject(["password"]);
     } catch {
@@ -21472,22 +21548,27 @@ function duration(since) {
 var ConnectionInfoModal = class extends import_obsidian.Modal {
   constructor(app, plugin) {
     super(app);
+    this.promptScope = "local";
     this.plugin = plugin;
   }
   onOpen() {
+    this.render();
+  }
+  copy(text, okMsg) {
+    navigator.clipboard.writeText(text).then(() => new import_obsidian.Notice(okMsg)).catch(() => new import_obsidian.Notice("\u06A9\u067E\u06CC \u0645\u0645\u06A9\u0646 \u0646\u0634\u062F \u2014 \u0628\u0647\u200C\u0635\u0648\u0631\u062A \u062F\u0633\u062A\u06CC \u0627\u0646\u062A\u062E\u0627\u0628 \u0648 \u06A9\u067E\u06CC \u06A9\u0646\u06CC\u062F."));
+  }
+  render() {
     const { contentEl } = this;
     contentEl.empty();
+    const p = this.plugin.settings;
     contentEl.createEl("h3", { text: "\u0627\u0637\u0644\u0627\u0639\u0627\u062A \u0627\u062A\u0635\u0627\u0644 SSH" });
     contentEl.createEl("p", {
-      text: "\u0627\u06CC\u0646 \u0627\u0637\u0644\u0627\u0639\u0627\u062A \u0631\u0627 \u0628\u0647 \u06A9\u0644\u0627\u06CC\u0646\u062A SSH \u06CC\u0627 \u062F\u0633\u062A\u06CC\u0627\u0631 \u0647\u0648\u0634 \u0645\u0635\u0646\u0648\u0639\u06CC \u0628\u062F\u0647\u06CC\u062F. \u0627\u06AF\u0631 \xAB\u062F\u0627\u0645\u0646\u0647\u200C\u06CC \u0627\u062A\u0635\u0627\u0644\xBB \u0631\u0648\u06CC localhost \u0627\u0633\u062A\u060C \u0641\u0642\u0637 \u0627\u0632 \u0647\u0645\u06CC\u0646 \u06A9\u0627\u0645\u067E\u06CC\u0648\u062A\u0631 \u0645\u06CC\u200C\u062A\u0648\u0627\u0646 \u0648\u0635\u0644 \u0634\u062F.",
+      text: "\u0627\u06CC\u0646 \u0627\u0637\u0644\u0627\u0639\u0627\u062A \u0631\u0627 \u0628\u0647 \u06A9\u0644\u0627\u06CC\u0646\u062A SSH \u06CC\u0627 \u062F\u0633\u062A\u06CC\u0627\u0631 \u0647\u0648\u0634 \u0645\u0635\u0646\u0648\u0639\u06CC \u0628\u062F\u0647\u06CC\u062F. \u0628\u0633\u062A\u0647 \u0628\u0647 \u0627\u06CC\u0646\u06A9\u0647 \u0647\u0648\u0634 \u0645\u0635\u0646\u0648\u0639\u06CC \u06A9\u062C\u0627\u0633\u062A\u060C \u06CC\u06A9\u06CC \u0627\u0632 \u0633\u0647 \u062D\u0627\u0644\u062A \u0632\u06CC\u0631 \u0631\u0627 \u0627\u0633\u062A\u0641\u0627\u062F\u0647 \u06A9\u0646\u06CC\u062F.",
       cls: "setting-item-description"
     });
-    const p = this.plugin.settings;
-    const host = this.plugin.hostDisplay();
-    const interactiveCmd = `ssh ${p.username}@${host} -p ${p.port}`;
-    const oneShotCmd = `ssh ${p.username}@${host} -p ${p.port} "ls"`;
-    const row = (name, value, mono = true) => {
+    const row = (name, value, mono = true, desc = "") => {
       const s = new import_obsidian.Setting(contentEl).setName(name);
+      if (desc) s.setDesc(desc);
       const val = s.addText((t) => {
         t.setValue(value);
         t.inputEl.readOnly = true;
@@ -21495,35 +21576,113 @@ var ConnectionInfoModal = class extends import_obsidian.Modal {
       });
       return val.settingEl;
     };
+    const cmdRow = (name, value, desc = "") => {
+      new import_obsidian.Setting(contentEl).setName(name).setDesc(desc).addText((t) => {
+        t.setValue(value);
+        t.inputEl.readOnly = true;
+        t.inputEl.addClass("vssh-mono");
+      }).addButton(
+        (b) => b.setButtonText("\u06A9\u067E\u06CC").onClick(() => this.copy(value, "\u0641\u0631\u0645\u0627\u0646 \u06A9\u067E\u06CC \u0634\u062F."))
+      );
+    };
     row("\u0646\u0627\u0645 \u06A9\u0627\u0631\u0628\u0631\u06CC", p.username, false);
     row("\u0631\u0645\u0632 \u0639\u0628\u0648\u0631", p.password);
     row("\u067E\u0648\u0631\u062A", String(p.port), false);
-    row("\u0641\u0631\u0645\u0627\u0646 \u0627\u062A\u0635\u0627\u0644 \u062A\u0639\u0627\u0645\u0644\u06CC", interactiveCmd);
-    row("\u0641\u0631\u0645\u0627\u0646 \u062A\u06A9\u200C\u062E\u0637\u06CC (\u0628\u0631\u0627\u06CC \u0647\u0648\u0634 \u0645\u0635\u0646\u0648\u0639\u06CC)", oneShotCmd);
+    contentEl.createEl("h4", { text: "\u06F1) \u0647\u0648\u0634 \u0645\u0635\u0646\u0648\u0639\u06CC \u0631\u0648\u06CC \u0647\u0645\u06CC\u0646 \u06A9\u0627\u0645\u067E\u06CC\u0648\u062A\u0631 (localhost)" });
+    cmdRow("\u0641\u0631\u0645\u0627\u0646 \u0627\u062A\u0635\u0627\u0644 \u062A\u0639\u0627\u0645\u0644\u06CC", `ssh ${p.username}@127.0.0.1 -p ${p.port}`);
+    cmdRow("\u0641\u0631\u0645\u0627\u0646 \u062A\u06A9\u200C\u062E\u0637\u06CC (\u0628\u0631\u0627\u06CC \u0627\u0628\u0632\u0627\u0631\u0647\u0627\u06CC AI)", `ssh ${p.username}@127.0.0.1 -p ${p.port} "ls"`);
+    contentEl.createEl("h4", { text: "\u06F2) \u062F\u0633\u062A\u06AF\u0627\u0647 \u062F\u06CC\u06AF\u0631 \u062F\u0631 \u0634\u0628\u06A9\u0647\u200C\u06CC \u0645\u062D\u0644\u06CC (\u0648\u0627\u06CC\u200C\u0641\u0627\u06CC / \u06A9\u0627\u0628\u0644)" });
+    const lanEp = this.plugin.endpointFor("lan");
+    cmdRow(
+      "\u0641\u0631\u0645\u0627\u0646 \u0627\u062A\u0635\u0627\u0644 \u0628\u0627 \u0622\u06CC\u200C\u067E\u06CC \u0634\u0628\u06A9\u0647",
+      `ssh ${p.username}@${lanEp.host} -p ${lanEp.port}`,
+      lanEp.ready ? "\u062F\u0627\u0645\u0646\u0647\u200C\u06CC \u0627\u062A\u0635\u0627\u0644 \u0631\u0648\u06CC \xAB\u0647\u0645\u0647\u200C\u06CC \u0634\u0628\u06A9\u0647\xBB \u062A\u0646\u0638\u06CC\u0645 \u0634\u062F\u0647 \u0627\u0633\u062A." : lanEp.hint
+    );
+    contentEl.createEl("h4", { text: "\u06F3) \u0627\u0632 \u0627\u06CC\u0646\u062A\u0631\u0646\u062A \u2014 \u0647\u0648\u0634 \u0645\u0635\u0646\u0648\u0639\u06CC \u0628\u06CC\u0631\u0648\u0646 \u0627\u0632 \u0634\u0628\u06A9\u0647 (\u062A\u0648\u0646\u0644 \u0639\u0645\u0648\u0645\u06CC)" });
+    const tunnelSetting = new import_obsidian.Setting(contentEl).setName("\u0648\u0636\u0639\u06CC\u062A \u062A\u0648\u0646\u0644 \u0639\u0645\u0648\u0645\u06CC");
+    this.fillTunnelStatus(tunnelSetting);
+    new import_obsidian.Setting(contentEl).setName("\u062A\u0648\u0646\u0644 \u0639\u0645\u0648\u0645\u06CC").setDesc("\u0628\u0627 \u06A9\u0644\u0627\u06CC\u0646\u062A OpenSSH \u0633\u06CC\u0633\u062A\u0645\u060C \u06CC\u06A9 \u0646\u0634\u0627\u0646\u06CC \u0639\u0645\u0648\u0645\u06CC \u0645\u0648\u0642\u062A \u0645\u06CC\u200C\u0633\u0627\u0632\u062F \u2014 \u0628\u062F\u0648\u0646 \u062A\u0646\u0638\u06CC\u0645 \u0645\u0648\u062F\u0645. \u0633\u0631\u0648\u06CC\u0633 \u0631\u0627\u06CC\u06AF\u0627\u0646 pinggy.io \u062A\u0648\u0635\u06CC\u0647 \u0645\u06CC\u200C\u0634\u0648\u062F.").addDropdown(
+      (d) => d.addOption("off", "\u062E\u0627\u0645\u0648\u0634").addOption("pinggy", "pinggy.io (\u0631\u0627\u06CC\u06AF\u0627\u0646 \u2014 \u067E\u06CC\u0634\u0646\u0647\u0627\u062F\u06CC)").addOption("serveo", "serveo.net").addOption("custom", "\u062F\u0633\u062A\u0648\u0631 \u0633\u0641\u0627\u0631\u0634\u06CC").setValue(p.tunnelMode).onChange(async (v) => {
+        this.plugin.settings.tunnelMode = v;
+        await this.plugin.savePluginData();
+        await this.plugin.applyTunnel();
+        this.render();
+      })
+    );
+    if (p.tunnelMode === "custom") {
+      new import_obsidian.Setting(contentEl).setName("\u062F\u0633\u062A\u0648\u0631 \u0633\u0641\u0627\u0631\u0634\u06CC \u062A\u0648\u0646\u0644").setDesc("\u0645\u062B\u0627\u0644: ssh -R 0:127.0.0.1:{PORT} user@your-server.com \u2014 {PORT} \u0628\u0627 \u067E\u0648\u0631\u062A \u0633\u0631\u0648\u0631 \u062C\u0627\u06CC\u06AF\u0632\u06CC\u0646 \u0645\u06CC\u200C\u0634\u0648\u062F.").addText(
+        (t) => t.setValue(p.tunnelCustom).onChange(async (v) => {
+          this.plugin.settings.tunnelCustom = v;
+          await this.plugin.savePluginData();
+        })
+      );
+    }
+    const st = this.plugin.tunnel?.state;
+    if (st?.status === "active" && st.host) {
+      cmdRow("\u0646\u0634\u0627\u0646\u06CC \u0639\u0645\u0648\u0645\u06CC \u0641\u0639\u0627\u0644", `ssh ${p.username}@${st.host} -p ${st.port}`, "\u0627\u06CC\u0646 \u0641\u0631\u0645\u0627\u0646 \u0627\u0632 \u0647\u0631 \u062C\u0627\u06CC \u0627\u06CC\u0646\u062A\u0631\u0646\u062A \u0642\u0627\u0628\u0644 \u0627\u0633\u062A\u0641\u0627\u062F\u0647 \u0627\u0633\u062A.");
+    }
+    const pubSetting = new import_obsidian.Setting(contentEl).setName("\u0622\u06CC\u200C\u067E\u06CC \u0639\u0645\u0648\u0645\u06CC \u0627\u06CC\u0646\u062A\u0631\u0646\u062A \u0634\u0645\u0627").setDesc("\u0628\u0631\u0627\u06CC \u0627\u062A\u0635\u0627\u0644 \u0645\u0633\u062A\u0642\u06CC\u0645 (\u0628\u062F\u0648\u0646 \u062A\u0648\u0646\u0644) \u0628\u0627\u06CC\u062F \u062F\u0631 \u0645\u0648\u062F\u0645\u060C \u067E\u0648\u0631\u062A TCP " + p.port + " \u0631\u0627 \u0628\u0647 \u0627\u06CC\u0646 \u06A9\u0627\u0645\u067E\u06CC\u0648\u062A\u0631 \u0641\u0648\u0631\u0648\u0627\u0631\u062F \u06A9\u0646\u06CC\u062F.");
+    pubSetting.addText((t) => {
+      t.setValue("\u062F\u0631 \u062D\u0627\u0644 \u062F\u0631\u06CC\u0627\u0641\u062A\u2026");
+      t.inputEl.readOnly = true;
+      t.inputEl.addClass("vssh-mono");
+      void this.plugin.fetchPublicIP().then((ip) => t.setValue(ip || "\u062F\u0631\u06CC\u0627\u0641\u062A \u0646\u0634\u062F"));
+    });
+    pubSetting.addButton(
+      (b) => b.setButtonText("\u0628\u0631\u0648\u0632\u0631\u0633\u0627\u0646\u06CC").onClick(() => {
+        void this.plugin.fetchPublicIP(true);
+        this.render();
+      })
+    );
+    contentEl.createEl("h4", { text: "\u067E\u0631\u0627\u0645\u067E\u062A \u0622\u0645\u0627\u062F\u0647 \u0628\u0631\u0627\u06CC \u0647\u0648\u0634 \u0645\u0635\u0646\u0648\u0639\u06CC" });
+    let promptArea = null;
+    new import_obsidian.Setting(contentEl).setName("\u0645\u0642\u0635\u062F \u0647\u0648\u0634 \u0645\u0635\u0646\u0648\u0639\u06CC").setDesc("\u067E\u0631\u0627\u0645\u067E\u062A \u0632\u06CC\u0631 \u0628\u0647\u200C\u0635\u0648\u0631\u062A \u062E\u0648\u062F\u06A9\u0627\u0631 \u0628\u0627 \u0647\u0645\u06CC\u0646 \u0627\u0637\u0644\u0627\u0639\u0627\u062A (\u0622\u062F\u0631\u0633\u060C \u0631\u0645\u0632 \u0648 \u0642\u0648\u0627\u0646\u06CC\u0646) \u0633\u0627\u062E\u062A\u0647 \u0645\u06CC\u200C\u0634\u0648\u062F.").addDropdown(
+      (d) => d.addOption("local", "\u0647\u0645\u06CC\u0646 \u06A9\u0627\u0645\u067E\u06CC\u0648\u062A\u0631 (127.0.0.1)").addOption("lan", "\u0634\u0628\u06A9\u0647\u200C\u06CC \u0645\u062D\u0644\u06CC (\u0622\u06CC\u200C\u067E\u06CC LAN)").addOption("tunnel", "\u0627\u06CC\u0646\u062A\u0631\u0646\u062A (\u062A\u0648\u0646\u0644 \u0639\u0645\u0648\u0645\u06CC)").setValue(this.promptScope).onChange((v) => {
+        this.promptScope = v;
+        if (promptArea) promptArea.value = this.plugin.aiPrompt(this.promptScope);
+      })
+    ).addButton(
+      (b) => b.setButtonText("\u06A9\u067E\u06CC \u067E\u0631\u0627\u0645\u067E\u062A").setCta().onClick(() => this.copy(this.plugin.aiPrompt(this.promptScope), "\u067E\u0631\u0627\u0645\u067E\u062A \u06A9\u067E\u06CC \u0634\u062F \u2014 \u0628\u0647 \u0647\u0648\u0634 \u0645\u0635\u0646\u0648\u0639\u06CC \u062E\u0648\u062F \u0628\u062F\u0647\u06CC\u062F."))
+    );
+    promptArea = contentEl.createEl("textarea", { cls: "vssh-wide vssh-mono" });
+    promptArea.rows = 10;
+    promptArea.readOnly = true;
+    promptArea.value = this.plugin.aiPrompt(this.promptScope);
+    contentEl.createEl("h4", { text: "\u0627\u0645\u0646\u06CC\u062A" });
     const fp = this.plugin.fingerprints();
     row("\u0627\u062B\u0631 \u0627\u0646\u06AF\u0634\u062A \u06A9\u0644\u06CC\u062F \u0645\u06CC\u0632\u0628\u0627\u0646 (Ed25519)", fp.ed);
     row("\u0627\u062B\u0631 \u0627\u0646\u06AF\u0634\u062A \u06A9\u0644\u06CC\u062F \u0645\u06CC\u0632\u0628\u0627\u0646 (RSA)", fp.rsa);
-    new import_obsidian.Setting(contentEl).setName("\u06A9\u067E\u06CC \u06A9\u0627\u0645\u0644 \u0627\u0637\u0644\u0627\u0639\u0627\u062A").setDesc("\u0647\u0645\u0647\u200C\u06CC \u0627\u0637\u0644\u0627\u0639\u0627\u062A \u0627\u062A\u0635\u0627\u0644 \u0628\u0647\u200C\u0635\u0648\u0631\u062A \u06CC\u06A9 \u0645\u062A\u0646 \u0622\u0645\u0627\u062F\u0647 \u0628\u0631\u0627\u06CC \u0627\u0631\u0633\u0627\u0644 \u0628\u0647 \u0647\u0648\u0634 \u0645\u0635\u0646\u0648\u0639\u06CC.").addButton(
-      (b) => b.setButtonText("\u06A9\u067E\u06CC").onClick(async () => {
-        const text = [
-          "\u0627\u062A\u0635\u0627\u0644 SSH \u0628\u0647 \u062E\u0632\u0627\u0646\u0647 \u0627\u0648\u0628\u0633\u06CC\u062F\u06CC\u0646 \u0645\u0646:",
-          `\u0641\u0631\u0645\u0627\u0646: ${interactiveCmd}`,
-          `\u0646\u0627\u0645 \u06A9\u0627\u0631\u0628\u0631\u06CC: ${p.username}`,
-          `\u0631\u0645\u0632 \u0639\u0628\u0648\u0631: ${p.password}`,
-          "\u067E\u0633 \u0627\u0632 \u0627\u062A\u0635\u0627\u0644\u060C \u062F\u0633\u062A\u0648\u0631 rules \u0631\u0627 \u0628\u062E\u0648\u0627\u0646 \u0648 \u0628\u0631\u0627\u06CC \u062F\u06CC\u062F\u0646 \u062F\u0633\u062A\u0648\u0631\u0627\u062A help \u0631\u0627 \u0627\u062C\u0631\u0627 \u06A9\u0646. \u062F\u0633\u062A\u0631\u0633\u06CC \u0641\u0642\u0637 \u062F\u0627\u062E\u0644 \u062E\u0632\u0627\u0646\u0647 \u0627\u0633\u062A."
-        ].join("\n");
-        try {
-          await navigator.clipboard.writeText(text);
-          new import_obsidian.Notice("\u0627\u0637\u0644\u0627\u0639\u0627\u062A \u0627\u062A\u0635\u0627\u0644 \u06A9\u067E\u06CC \u0634\u062F.");
-        } catch {
-          new import_obsidian.Notice("\u06A9\u067E\u06CC \u0645\u0645\u06A9\u0646 \u0646\u0634\u062F.");
-        }
-      })
-    );
     contentEl.createEl("p", {
-      text: "\u0646\u06A9\u062A\u0647: \u062A\u063A\u06CC\u06CC\u0631 \u0631\u0645\u0632 \u06CC\u0627 \u0646\u0627\u0645 \u06A9\u0627\u0631\u0628\u0631\u06CC \u0628\u0644\u0627\u0641\u0627\u0635\u0644\u0647 \u0627\u0639\u0645\u0627\u0644 \u0645\u06CC\u200C\u0634\u0648\u062F\u061B \u06A9\u0644\u0627\u06CC\u0646\u062A\u200C\u0647\u0627\u06CC \u0645\u062A\u0635\u0644 \u0628\u0627\u06CC\u062F \u062F\u0648\u0628\u0627\u0631\u0647 \u0648\u0635\u0644 \u0634\u0648\u0646\u062F.",
+      text: "\u062A\u063A\u06CC\u06CC\u0631 \u0631\u0645\u0632 \u06CC\u0627 \u0646\u0627\u0645 \u06A9\u0627\u0631\u0628\u0631\u06CC \u0628\u0644\u0627\u0641\u0627\u0635\u0644\u0647 \u0627\u0639\u0645\u0627\u0644 \u0645\u06CC\u200C\u0634\u0648\u062F. \u067E\u0633 \u0627\u0632 \u062A\u0644\u0627\u0634\u200C\u0647\u0627\u06CC \u0646\u0627\u0645\u0648\u0641\u0642 \u0645\u06A9\u0631\u0631\u060C IP \u0645\u062A\u062E\u0644\u0641 \u0645\u0633\u062F\u0648\u062F \u0645\u06CC\u200C\u0634\u0648\u062F (\u062A\u0646\u0638\u06CC\u0645\u0627\u062A: \u0645\u062D\u0627\u0641\u0638\u062A \u0634\u06A9\u0633\u062A \u0631\u0645\u0632). \u0628\u0639\u062F \u0627\u0632 \u067E\u0627\u06CC\u0627\u0646 \u06A9\u0627\u0631\u060C \u062A\u0648\u0646\u0644 \u0631\u0627 \u062E\u0627\u0645\u0648\u0634 \u06A9\u0646\u06CC\u062F.",
       cls: "setting-item-description"
     });
+  }
+  fillTunnelStatus(setting) {
+    const st = this.plugin.tunnel?.state;
+    let text = "\u062E\u0627\u0645\u0648\u0634";
+    if (st?.status === "active") text = `\u0641\u0639\u0627\u0644 \u2705 ${st.endpoint}`;
+    else if (st?.status === "starting") text = "\u062F\u0631 \u062D\u0627\u0644 \u0627\u062A\u0635\u0627\u0644 \u0628\u0647 \u0633\u0631\u0648\u06CC\u0633 \u062A\u0648\u0646\u0644\u2026";
+    else if (st?.status === "error") text = "\u062E\u0637\u0627: " + st.error;
+    setting.setDesc(text);
+    setting.addButton(
+      (b) => b.setButtonText(st?.status === "off" || st?.status === "error" ? "\u0634\u0631\u0648\u0639 \u062A\u0648\u0646\u0644" : "\u062A\u0648\u0642\u0641 \u062A\u0648\u0646\u0644").onClick(async () => {
+        if (this.plugin.settings.tunnelMode === "off") {
+          new import_obsidian.Notice("\u0627\u0648\u0644 \xAB\u062A\u0648\u0646\u0644 \u0639\u0645\u0648\u0645\u06CC\xBB \u0631\u0627 \u062F\u0631 \u0647\u0645\u06CC\u0646 \u067E\u0646\u062C\u0631\u0647 \u0627\u0646\u062A\u062E\u0627\u0628 \u06A9\u0646\u06CC\u062F (\u0645\u062B\u0644\u0627\u064B pinggy.io).");
+          return;
+        }
+        if (st && (st.status === "starting" || st.status === "active")) {
+          await this.plugin.tunnel.stop();
+        } else {
+          if (!this.plugin.server.isRunning()) await this.plugin.startServer();
+          await this.plugin.tunnel.start(
+            this.plugin.settings.tunnelMode,
+            this.plugin.settings.port,
+            this.plugin.settings.tunnelCustom
+          );
+        }
+        this.render();
+      })
+    );
   }
   onClose() {
     this.contentEl.empty();
@@ -21560,15 +21719,31 @@ var SessionsModal = class extends import_obsidian.Modal {
         })
       );
     }
+    const bans = this.plugin.server.listBans();
+    if (bans.length > 0) {
+      contentEl.createEl("h4", { text: "IP\u0647\u0627\u06CC \u0645\u0633\u062F\u0648\u062F\u0634\u062F\u0647 (\u0645\u062D\u0627\u0641\u0638\u062A \u0634\u06A9\u0633\u062A \u0631\u0645\u0632)" });
+      for (const ban of bans) {
+        new import_obsidian.Setting(contentEl).setName(ban.ip).setDesc(`${Math.ceil(ban.remainingMs / 1e3)} \u062B\u0627\u0646\u06CC\u0647 \u0645\u0627\u0646\u062F\u0647`).addButton(
+          (b) => b.setButtonText("\u0631\u0641\u0639 \u0645\u0633\u062F\u0648\u062F\u06CC").onClick(() => {
+            this.plugin.server.clearBans();
+            this.render();
+          })
+        );
+      }
+      new import_obsidian.Setting(contentEl).addButton(
+        (b) => b.setButtonText("\u0631\u0641\u0639 \u0647\u0645\u0647\u200C\u06CC \u0645\u0633\u062F\u0648\u062F\u06CC\u200C\u0647\u0627").setWarning().onClick(() => {
+          this.plugin.server.clearBans();
+          this.render();
+        })
+      );
+    }
     contentEl.createEl("h4", { text: "\u0648\u0642\u0627\u06CC\u0639 \u0627\u062E\u06CC\u0631" });
     const logBox = contentEl.createDiv("vssh-log");
     const pre = logBox.createEl("pre");
     pre.setText(
       this.plugin.logEntries.slice(-30).map((e) => `${new Date(e.time).toLocaleTimeString()}  ${e.text}`).join("\n") || "\u2014"
     );
-    new import_obsidian.Setting(contentEl).addButton(
-      (b) => b.setButtonText("\u0628\u0631\u0648\u0632\u0631\u0633\u0627\u0646\u06CC").onClick(() => this.render())
-    );
+    new import_obsidian.Setting(contentEl).addButton((b) => b.setButtonText("\u0628\u0631\u0648\u0632\u0631\u0633\u0627\u0646\u06CC").onClick(() => this.render()));
   }
   onClose() {
     this.contentEl.empty();
@@ -21611,8 +21786,8 @@ var VaultSSHSettingTab = class extends import_obsidian2.PluginSettingTab {
         }
       });
     });
-    new import_obsidian2.Setting(containerEl).setName("\u062F\u0627\u0645\u0646\u0647\u200C\u06CC \u0627\u062A\u0635\u0627\u0644").setDesc("\xAB\u0641\u0642\u0637 \u0647\u0645\u06CC\u0646 \u06A9\u0627\u0645\u067E\u06CC\u0648\u062A\u0631\xBB \u0627\u0645\u0646\u200C\u062A\u0631\u06CC\u0646 \u062D\u0627\u0644\u062A \u0627\u0633\u062A. \xAB\u0647\u0645\u0647\u200C\u06CC \u0634\u0628\u06A9\u0647\xBB \u0641\u0642\u0637 \u0627\u06AF\u0631 \u062F\u0633\u062A\u06AF\u0627\u0647 \u062F\u06CC\u06AF\u0631\u06CC (\u0645\u062B\u0644\u0627\u064B \u06AF\u0648\u0634\u06CC \u06CC\u0627 \u0633\u0631\u0648\u0631 \u0647\u0648\u0634 \u0645\u0635\u0646\u0648\u0639\u06CC) \u0642\u0631\u0627\u0631 \u0627\u0633\u062A \u0648\u0635\u0644 \u0634\u0648\u062F \u0648 \u0631\u0645\u0632 \u0642\u0648\u06CC \u06AF\u0630\u0627\u0634\u062A\u0647\u200C\u0627\u06CC\u062F.").addDropdown(
-      (d) => d.addOption("127.0.0.1", "\u0641\u0642\u0637 \u0647\u0645\u06CC\u0646 \u06A9\u0627\u0645\u067E\u06CC\u0648\u062A\u0631 (localhost) \u2014 \u067E\u06CC\u0634\u0646\u0647\u0627\u062F\u06CC").addOption("0.0.0.0", "\u0647\u0645\u0647\u200C\u06CC \u0634\u0628\u06A9\u0647 (\u06A9\u0645\u062A\u0631 \u0627\u0645\u0646)").setValue(this.plugin.settings.bindAddress === "0.0.0.0" ? "0.0.0.0" : "127.0.0.1").onChange(async (v) => {
+    new import_obsidian2.Setting(containerEl).setName("\u062F\u0627\u0645\u0646\u0647\u200C\u06CC \u0627\u062A\u0635\u0627\u0644").setDesc("\xAB\u0641\u0642\u0637 \u0647\u0645\u06CC\u0646 \u06A9\u0627\u0645\u067E\u06CC\u0648\u062A\u0631\xBB \u0628\u0631\u0627\u06CC \u0647\u0648\u0634 \u0645\u0635\u0646\u0648\u0639\u06CC \u0631\u0648\u06CC \u0647\u0645\u06CC\u0646 \u0633\u06CC\u0633\u062A\u0645 \u06A9\u0627\u0641\u06CC \u0627\u0633\u062A. \xAB\u0647\u0645\u0647\u200C\u06CC \u0634\u0628\u06A9\u0647\xBB \u0628\u0631\u0627\u06CC \u0627\u062A\u0635\u0627\u0644 \u0627\u0632 \u06AF\u0648\u0634\u06CC/\u0644\u067E\u200C\u062A\u0627\u067E \u062F\u06CC\u06AF\u0631 (\u0622\u06CC\u200C\u067E\u06CC \u0645\u062B\u0644 192.168.x.x). \u0628\u0631\u0627\u06CC \u0627\u06CC\u0646\u062A\u0631\u0646\u062A \u0627\u0632 \u0628\u062E\u0634 \xAB\u062A\u0648\u0646\u0644 \u0639\u0645\u0648\u0645\u06CC\xBB \u0627\u0633\u062A\u0641\u0627\u062F\u0647 \u06A9\u0646\u06CC\u062F.").addDropdown(
+      (d) => d.addOption("127.0.0.1", "\u0641\u0642\u0637 \u0647\u0645\u06CC\u0646 \u06A9\u0627\u0645\u067E\u06CC\u0648\u062A\u0631 (localhost) \u2014 \u067E\u06CC\u0634\u0646\u0647\u0627\u062F\u06CC").addOption("0.0.0.0", "\u0647\u0645\u0647\u200C\u06CC \u0634\u0628\u06A9\u0647 (\u0627\u062A\u0635\u0627\u0644 \u0627\u0632 \u062F\u0633\u062A\u06AF\u0627\u0647 \u062F\u06CC\u06AF\u0631)").setValue(this.plugin.settings.bindAddress === "0.0.0.0" ? "0.0.0.0" : "127.0.0.1").onChange(async (v) => {
         this.plugin.settings.bindAddress = v;
         await this.plugin.savePluginData();
         if (this.plugin.server?.isRunning()) {
@@ -21620,6 +21795,57 @@ var VaultSSHSettingTab = class extends import_obsidian2.PluginSettingTab {
         }
       })
     );
+    containerEl.createEl("h3", { text: "\u062F\u0633\u062A\u0631\u0633\u06CC \u062E\u0627\u0631\u062C\u06CC (\u0634\u0628\u06A9\u0647 / \u0627\u06CC\u0646\u062A\u0631\u0646\u062A)" });
+    new import_obsidian2.Setting(containerEl).setName("\u062A\u0648\u0646\u0644 \u0639\u0645\u0648\u0645\u06CC \u0628\u0631\u0627\u06CC \u0627\u06CC\u0646\u062A\u0631\u0646\u062A").setDesc("\u0628\u0631\u0627\u06CC \u0627\u06CC\u0646\u06A9\u0647 \u0647\u0648\u0634 \u0645\u0635\u0646\u0648\u0639\u06CC\u0650 \u0628\u06CC\u0631\u0648\u0646 \u0627\u0632 \u0634\u0628\u06A9\u0647 (\u0631\u0648\u06CC \u0633\u0631\u0648\u0631 \u0627\u06CC\u0646\u062A\u0631\u0646\u062A\u06CC) \u0628\u062A\u0648\u0627\u0646\u062F \u0648\u0635\u0644 \u0634\u0648\u062F. \u062A\u0648\u0646\u0644 \u0628\u0627 \u06A9\u0644\u0627\u06CC\u0646\u062A OpenSSH \u0633\u06CC\u0633\u062A\u0645 \u0633\u0627\u062E\u062A\u0647 \u0645\u06CC\u200C\u0634\u0648\u062F \u0648 \u0628\u062F\u0648\u0646 \u062A\u0646\u0638\u06CC\u0645 \u0645\u0648\u062F\u0645 \u06A9\u0627\u0631 \u0645\u06CC\u200C\u06A9\u0646\u062F. \u0633\u0631\u0648\u06CC\u0633 \u0631\u0627\u06CC\u06AF\u0627\u0646 pinggy.io \u062D\u062F\u0648\u062F \u06F6\u06F0 \u062F\u0642\u06CC\u0642\u0647 \u0641\u0639\u0627\u0644 \u0645\u06CC\u200C\u0645\u0627\u0646\u062F.").addDropdown(
+      (d) => d.addOption("off", "\u062E\u0627\u0645\u0648\u0634").addOption("pinggy", "pinggy.io (\u0631\u0627\u06CC\u06AF\u0627\u0646 \u2014 \u067E\u06CC\u0634\u0646\u0647\u0627\u062F\u06CC)").addOption("serveo", "serveo.net").addOption("custom", "\u062F\u0633\u062A\u0648\u0631 \u0633\u0641\u0627\u0631\u0634\u06CC").setValue(this.plugin.settings.tunnelMode).onChange(async (v) => {
+        this.plugin.settings.tunnelMode = v;
+        await this.plugin.savePluginData();
+        await this.plugin.applyTunnel();
+        this.display();
+      })
+    );
+    if (this.plugin.settings.tunnelMode === "custom") {
+      new import_obsidian2.Setting(containerEl).setName("\u062F\u0633\u062A\u0648\u0631 \u0633\u0641\u0627\u0631\u0634\u06CC \u062A\u0648\u0646\u0644").setDesc("\u0645\u062B\u0627\u0644: ssh -R 0:127.0.0.1:{PORT} user@your-server.com  \u2014 {PORT} \u0628\u0627 \u067E\u0648\u0631\u062A \u0633\u0631\u0648\u0631 \u062C\u0627\u06CC\u06AF\u0632\u06CC\u0646 \u0645\u06CC\u200C\u0634\u0648\u062F.").addText(
+        (t) => t.setValue(this.plugin.settings.tunnelCustom).onChange(async (v) => {
+          this.plugin.settings.tunnelCustom = v;
+          await this.plugin.savePluginData();
+        })
+      );
+    }
+    const tunnelStatus = new import_obsidian2.Setting(containerEl).setName("\u0648\u0636\u0639\u06CC\u062A \u062A\u0648\u0646\u0644");
+    const ts = this.plugin.tunnel?.state;
+    tunnelStatus.setDesc(
+      ts?.status === "active" ? `\u0641\u0639\u0627\u0644 \u2705 ssh -p ${ts.port} ${this.plugin.settings.username}@${ts.host}` : ts?.status === "starting" ? "\u062F\u0631 \u062D\u0627\u0644 \u0627\u062A\u0635\u0627\u0644 \u0628\u0647 \u0633\u0631\u0648\u06CC\u0633 \u062A\u0648\u0646\u0644\u2026 (\u0686\u0646\u062F \u062B\u0627\u0646\u06CC\u0647 \u0635\u0628\u0631 \u06A9\u0646\u06CC\u062F)" : ts?.status === "error" ? "\u062E\u0637\u0627: " + ts.error : "\u062E\u0627\u0645\u0648\u0634 \u2014 \u0628\u0627 \u0627\u0646\u062A\u062E\u0627\u0628 \u0633\u0631\u0648\u06CC\u0633 \u0628\u0627\u0644\u0627\u060C \u062A\u0648\u0646\u0644 \u062E\u0648\u062F\u06A9\u0627\u0631 \u0628\u0627 \u0633\u0631\u0648\u0631 \u0634\u0631\u0648\u0639 \u0645\u06CC\u200C\u0634\u0648\u062F."
+    );
+    tunnelStatus.addButton(
+      (b) => b.setButtonText("\u0634\u0631\u0648\u0639 \u062A\u0648\u0646\u0644").onClick(async () => {
+        if (this.plugin.settings.tunnelMode === "off") {
+          new import_obsidian2.Notice("\u0627\u0648\u0644 \u0633\u0631\u0648\u06CC\u0633 \u062A\u0648\u0646\u0644 \u0631\u0627 \u0627\u0646\u062A\u062E\u0627\u0628 \u06A9\u0646\u06CC\u062F.");
+          return;
+        }
+        if (!this.plugin.server.isRunning()) await this.plugin.startServer();
+        await this.plugin.tunnel.start(this.plugin.settings.tunnelMode, this.plugin.settings.port, this.plugin.settings.tunnelCustom);
+        this.display();
+      })
+    );
+    tunnelStatus.addButton(
+      (b) => b.setButtonText("\u062A\u0648\u0642\u0641 \u062A\u0648\u0646\u0644").onClick(async () => {
+        await this.plugin.tunnel.stop();
+        this.display();
+      })
+    );
+    if (ts?.status === "active" && ts.host) {
+      tunnelStatus.addButton(
+        (b) => b.setButtonText("\u06A9\u067E\u06CC \u0646\u0634\u0627\u0646\u06CC").onClick(async () => {
+          try {
+            await navigator.clipboard.writeText(`ssh -p ${ts.port} ${this.plugin.settings.username}@${ts.host}`);
+            new import_obsidian2.Notice("\u0646\u0634\u0627\u0646\u06CC \u0639\u0645\u0648\u0645\u06CC \u06A9\u067E\u06CC \u0634\u062F.");
+          } catch {
+            new import_obsidian2.Notice("\u06A9\u067E\u06CC \u0645\u0645\u06A9\u0646 \u0646\u0634\u062F.");
+          }
+        })
+      );
+    }
     containerEl.createEl("h3", { text: "\u0627\u062D\u0631\u0627\u0632 \u0647\u0648\u06CC\u062A" });
     new import_obsidian2.Setting(containerEl).setName("\u0646\u0627\u0645 \u06A9\u0627\u0631\u0628\u0631\u06CC").setDesc("\u0646\u0627\u0645 \u06A9\u0627\u0631\u0628\u0631\u06CC \u0628\u0631\u0627\u06CC \u0648\u0631\u0648\u062F \u06A9\u0644\u0627\u06CC\u0646\u062A\u200C\u0647\u0627 \u0648 \u0647\u0648\u0634 \u0645\u0635\u0646\u0648\u0639\u06CC (\u0645\u062B\u0644\u0627\u064B ai).").addText(
       (t) => t.setValue(this.plugin.settings.username).onChange(async (v) => {
@@ -21725,6 +21951,37 @@ var VaultSSHSettingTab = class extends import_obsidian2.PluginSettingTab {
         await this.plugin.savePluginData();
       })
     );
+    new import_obsidian2.Setting(containerEl).setName("\u0645\u062D\u0627\u0641\u0638\u062A \u062F\u0631 \u0628\u0631\u0627\u0628\u0631 \u062D\u0645\u0644\u0647\u200C\u06CC \u0631\u0645\u0632").setDesc("\u0627\u06AF\u0631 \u06CC\u06A9 IP \u0686\u0646\u062F \u0628\u0627\u0631 \u0631\u0645\u0632 \u0627\u0634\u062A\u0628\u0627\u0647 \u0628\u0632\u0646\u062F\u060C \u0645\u0648\u0642\u062A\u0627\u064B \u0645\u0633\u062F\u0648\u062F \u0645\u06CC\u200C\u0634\u0648\u062F. \u0645\u062E\u0635\u0648\u0635\u0627\u064B \u0648\u0642\u062A\u06CC \u0633\u0631\u0648\u0631 \u0631\u0648\u06CC \xAB\u0647\u0645\u0647\u200C\u06CC \u0634\u0628\u06A9\u0647\xBB \u06CC\u0627 \u062A\u0648\u0646\u0644 \u0639\u0645\u0648\u0645\u06CC \u0627\u0633\u062A\u060C \u0631\u0648\u0634\u0646 \u0628\u0645\u0627\u0646\u062F.").addToggle(
+      (t) => t.setValue(this.plugin.settings.bruteforceProtect).onChange(async (v) => {
+        this.plugin.settings.bruteforceProtect = v;
+        await this.plugin.savePluginData();
+      })
+    );
+    new import_obsidian2.Setting(containerEl).setName("\u062D\u062F \u062A\u0644\u0627\u0634 \u0646\u0627\u0645\u0648\u0641\u0642 \u0628\u0631\u0627\u06CC \u0645\u0633\u062F\u0648\u062F\u06CC").setDesc("\u0686\u0646\u062F \u062A\u0644\u0627\u0634 \u0646\u0627\u0645\u0648\u0641\u0642 \u0648\u0631\u0648\u062F \u0627\u0632 \u06CC\u06A9 IP (\u062F\u0631 \u06F1\u06F0 \u062F\u0642\u06CC\u0642\u0647) \u0628\u0627\u0639\u062B \u0645\u0633\u062F\u0648\u062F\u06CC \u0645\u0648\u0642\u062A \u0634\u0648\u062F. (\u067E\u06CC\u0634\u200C\u0641\u0631\u0636: 5)").addText((t) => {
+      t.inputEl.type = "number";
+      t.setValue(String(this.plugin.settings.maxAuthFails));
+      t.onChange(async (v) => {
+        const n = parseInt(v, 10);
+        if (!isNaN(n) && n >= 2 && n <= 50) {
+          this.plugin.settings.maxAuthFails = n;
+          await this.plugin.savePluginData();
+        }
+      });
+    });
+    new import_obsidian2.Setting(containerEl).setName("\u0645\u062F\u062A \u0645\u0633\u062F\u0648\u062F\u06CC IP (\u062F\u0642\u06CC\u0642\u0647)").setDesc("\u0645\u062F\u062A \u0632\u0645\u0627\u0646 \u0645\u0633\u062F\u0648\u062F \u0628\u0648\u062F\u0646 \u06CC\u06A9 IP \u0645\u062A\u062E\u0644\u0641. (\u067E\u06CC\u0634\u200C\u0641\u0631\u0636: 10)").addText((t) => {
+      t.inputEl.type = "number";
+      t.setValue(String(this.plugin.settings.banMinutes));
+      t.onChange(async (v) => {
+        const n = parseInt(v, 10);
+        if (!isNaN(n) && n >= 1 && n <= 1440) {
+          this.plugin.settings.banMinutes = n;
+          await this.plugin.savePluginData();
+        }
+      });
+    });
+    new import_obsidian2.Setting(containerEl).setName("\u0645\u0633\u062F\u0648\u062F\u06CC\u200C\u0647\u0627\u06CC \u0641\u0639\u0627\u0644").setDesc(
+      this.plugin.server.listBans().length > 0 ? this.plugin.server.listBans().length + " IP \u0645\u0633\u062F\u0648\u062F \u0634\u062F\u0647 \u2014 \u0627\u0632 \xAB\u0646\u0634\u0633\u062A\u200C\u0647\u0627\u06CC \u0641\u0639\u0627\u0644\xBB \u0642\u0627\u0628\u0644 \u0631\u0641\u0639 \u0627\u0633\u062A." : "\u0647\u06CC\u0686 IP \u0645\u0633\u062F\u0648\u062F\u06CC \u0648\u062C\u0648\u062F \u0646\u062F\u0627\u0631\u062F."
+    );
     new import_obsidian2.Setting(containerEl).setName("\u062B\u0628\u062A \u0648\u0642\u0627\u06CC\u0639 \u062F\u0631 \u06A9\u0646\u0633\u0648\u0644 \u062A\u0648\u0633\u0639\u0647\u200C\u062F\u0647\u0646\u062F\u0647").setDesc("\u0648\u0631\u0648\u062F/\u062E\u0631\u0648\u062C \u0648 \u062F\u0633\u062A\u0648\u0631\u0627\u062A \u062F\u0631 \u06A9\u0646\u0633\u0648\u0644 (Ctrl+Shift+I) \u0647\u0645 \u062B\u0628\u062A \u0645\u06CC\u200C\u0634\u0648\u0646\u062F.").addToggle(
       (t) => t.setValue(this.plugin.settings.logToConsole).onChange(async (v) => {
         this.plugin.settings.logToConsole = v;
@@ -21760,6 +22017,198 @@ var VaultSSHSettingTab = class extends import_obsidian2.PluginSettingTab {
   }
 };
 
+// src/tunnel.ts
+var import_child_process = require("child_process");
+
+// src/netinfo.ts
+var os = __toESM(require("os"));
+function lanIPv4s() {
+  const out = [];
+  try {
+    const ifaces = os.networkInterfaces();
+    for (const [name, list] of Object.entries(ifaces)) {
+      for (const ni of list ?? []) {
+        if (String(ni.family) === "IPv4" && !ni.internal) {
+          out.push({ name, address: ni.address });
+        }
+      }
+    }
+  } catch {
+  }
+  return out;
+}
+function isPrivateIPv4(ip) {
+  return /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.)/.test(ip);
+}
+function bestLanIPv4() {
+  const ips = lanIPv4s();
+  const priv = ips.find((i) => isPrivateIPv4(i.address));
+  if (priv) return priv.address;
+  return ips[0]?.address ?? "";
+}
+function validHost(h) {
+  return !!h && h !== "127.0.0.1" && h !== "localhost" && h !== "0.0.0.0" && h !== "::1" && h !== "::" && !h.startsWith(".");
+}
+function validPort(p, localPort) {
+  return isFinite(p) && p > 0 && p <= 65535 && !(localPort && p === localPort);
+}
+function parseTunnelEndpoint(text, localPort) {
+  if (!text) return null;
+  const candidates = [];
+  const push = (hostRaw, portRaw) => {
+    const host = hostRaw.replace(/^\[|\]$/g, "").toLowerCase();
+    const port = parseInt(portRaw, 10);
+    if (!validHost(host) || !validPort(port, localPort)) return;
+    candidates.push({ host, port });
+  };
+  for (const m of text.matchAll(/tcp:\/\/([a-zA-Z0-9.\-]+):(\d{2,5})/g)) push(m[1], m[2]);
+  for (const m of text.matchAll(/forwarding tcp connections? to ([a-zA-Z0-9.\-]+):(\d{2,5})/gi)) push(m[1], m[2]);
+  for (const m of text.matchAll(/\b([a-zA-Z][a-zA-Z0-9\-]*(?:\.[a-zA-Z0-9\-]+)+):(\d{2,5})\b/g)) push(m[1], m[2]);
+  for (const m of text.matchAll(/\b(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})\b/g)) push(m[1], m[2]);
+  return candidates.length ? candidates[0] : null;
+}
+function buildTunnelSpec(kind, localPort, customCmd) {
+  const common = [
+    "-o",
+    "StrictHostKeyChecking=no",
+    "-o",
+    "ServerAliveInterval=30",
+    "-o",
+    "ServerAliveCountMax=3",
+    "-o",
+    "ExitOnForwardFailure=yes",
+    "-o",
+    "ConnectTimeout=15"
+  ];
+  if (kind === "serveo") {
+    return { cmd: "ssh", args: [...common, "-R", `0:127.0.0.1:${localPort}`, "serveo.net"], service: "serveo.net" };
+  }
+  if (kind === "custom") {
+    const filled = (customCmd || "").trim().replace(/\{PORT\}/g, String(localPort));
+    const toks = filled.split(/\s+/).filter(Boolean);
+    return { cmd: toks[0] || "ssh", args: toks.slice(1), service: "custom" };
+  }
+  return {
+    cmd: "ssh",
+    args: ["-p", "443", ...common, "-R", `0:127.0.0.1:${localPort}`, "a.pinggy.io"],
+    service: "a.pinggy.io"
+  };
+}
+
+// src/tunnel.ts
+var MAXBUF = 16 * 1024;
+function emptyState() {
+  return { status: "off", mode: "off", endpoint: "", host: "", port: 0, error: "", since: 0 };
+}
+var TunnelManager = class {
+  constructor(hooks) {
+    this.hooks = hooks;
+    this.proc = null;
+    this.out = "";
+    this.stoppedByUs = false;
+    this.state = emptyState();
+  }
+  isRunning() {
+    return this.state.status === "starting" || this.state.status === "active";
+  }
+  isActive() {
+    return this.state.status === "active" && !!this.state.host;
+  }
+  async start(mode, localPort, customCmd) {
+    await this.stop();
+    if (mode === "off") return;
+    this.stoppedByUs = false;
+    const spec = buildTunnelSpec(
+      mode === "serveo" ? "serveo" : mode === "custom" ? "custom" : "pinggy",
+      localPort,
+      customCmd
+    );
+    this.out = "";
+    this.state = { status: "starting", mode, endpoint: "", host: "", port: 0, error: "", since: Date.now() };
+    this.hooks.onStatusChanged();
+    let proc;
+    try {
+      proc = (0, import_child_process.spawn)(spec.cmd, spec.args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    } catch (e) {
+      this.state = { ...this.state, status: "error", error: "ssh client could not be started: " + e.message };
+      this.hooks.log("tunnel spawn failed: " + e.message);
+      this.hooks.onStatusChanged();
+      return;
+    }
+    this.proc = proc;
+    this.hooks.log(`tunnel starting via ${spec.service} -> 127.0.0.1:${localPort}`);
+    const onData = (d) => {
+      if (this.out.length < MAXBUF) this.out += d.toString("utf8");
+      if (this.state.status === "starting") {
+        const ep = parseTunnelEndpoint(this.out, localPort);
+        if (ep) {
+          this.state = {
+            ...this.state,
+            status: "active",
+            host: ep.host,
+            port: ep.port,
+            endpoint: `${ep.host}:${ep.port}`
+          };
+          this.hooks.log(`tunnel active: ${ep.host}:${ep.port} -> 127.0.0.1:${localPort}`);
+          this.hooks.notify(`\u062A\u0648\u0646\u0644 \u0639\u0645\u0648\u0645\u06CC \u0641\u0639\u0627\u0644 \u0634\u062F: ${ep.host}:${ep.port}`);
+          this.hooks.onStatusChanged();
+        }
+      }
+    };
+    proc.stdout?.on("data", onData);
+    proc.stderr?.on("data", onData);
+    proc.on("error", (err) => {
+      const enoent = err.code === "ENOENT";
+      this.state = {
+        ...this.state,
+        status: "error",
+        error: enoent ? "\u06A9\u0644\u0627\u06CC\u0646\u062A ssh \u062F\u0631 \u0633\u06CC\u0633\u062A\u0645 \u067E\u06CC\u062F\u0627 \u0646\u0634\u062F (OpenSSH Client)." : err.message
+      };
+      this.hooks.log("tunnel error: " + err.message);
+      this.hooks.notify(
+        enoent ? "Vault SSH: \u0628\u0631\u0627\u06CC \u062A\u0648\u0646\u0644 \u0639\u0645\u0648\u0645\u06CC\u060C \u06A9\u0644\u0627\u06CC\u0646\u062A OpenSSH \u0628\u0627\u06CC\u062F \u0646\u0635\u0628 \u0628\u0627\u0634\u062F (\u0648\u06CC\u0646\u062F\u0648\u0632 \u06F1\u06F0+ \u0628\u0647\u200C\u0635\u0648\u0631\u062A \u067E\u06CC\u0634\u200C\u0641\u0631\u0636 \u062F\u0627\u0631\u062F)." : "Vault SSH: \u062E\u0637\u0627\u06CC \u062A\u0648\u0646\u0644 \u2014 " + err.message
+      );
+      this.hooks.onStatusChanged();
+    });
+    proc.on("exit", (code) => {
+      this.proc = null;
+      if (this.stoppedByUs) return;
+      const ep = parseTunnelEndpoint(this.out, localPort);
+      if (ep) {
+        this.state = { ...this.state, status: "error", error: `\u062A\u0648\u0646\u0644 \u0642\u0637\u0639 \u0634\u062F (${ep.host}:${ep.port}) \u2014 \u062F\u0648\u0628\u0627\u0631\u0647 \u0634\u0631\u0648\u0639 \u06A9\u0646\u06CC\u062F.` };
+      } else {
+        const tail = this.out.trim().split(/\r?\n/).filter((l) => l.trim()).slice(-3).join(" | ");
+        this.state = { ...this.state, status: "error", error: `\u062A\u0648\u0646\u0644 \u0628\u0633\u062A\u0647 \u0634\u062F (\u06A9\u062F ${code}). ${tail.slice(0, 220)}` };
+      }
+      this.hooks.log(`tunnel exited (code ${code})`);
+      this.hooks.notify("Vault SSH: \u062A\u0648\u0646\u0644 \u0639\u0645\u0648\u0645\u06CC \u0642\u0637\u0639 \u0634\u062F.");
+      this.hooks.onStatusChanged();
+    });
+  }
+  async stop() {
+    this.stoppedByUs = true;
+    const proc = this.proc;
+    this.proc = null;
+    if (proc) {
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+      }
+      const t = setTimeout(() => {
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+        }
+      }, 2e3);
+      t.unref?.();
+    }
+    if (this.state.status !== "off") {
+      this.state = emptyState();
+      this.hooks.onStatusChanged();
+    }
+  }
+};
+
 // src/main.ts
 var PASSWORD_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
 function randomPassword(len = 14) {
@@ -21774,6 +22223,7 @@ var VaultSSHPlugin = class extends import_obsidian3.Plugin {
     super(...arguments);
     this.logEntries = [];
     this.statusEl = null;
+    this.publicIPCache = { value: "", at: 0 };
   }
   async onload() {
     const data = await this.loadData();
@@ -21801,6 +22251,11 @@ var VaultSSHPlugin = class extends import_obsidian3.Plugin {
         onStatusChanged: () => this.updateStatusBar()
       }
     );
+    this.tunnel = new TunnelManager({
+      log: (t) => this.pushLog(t),
+      notify: (t) => new import_obsidian3.Notice(t, 1e4),
+      onStatusChanged: () => this.updateStatusBar()
+    });
     this.addSettingTab(new VaultSSHSettingTab(this.app, this));
     const ribbon = this.addRibbonIcon("terminal-square", "Vault SSH Bridge \u2014 \u0634\u0631\u0648\u0639/\u062A\u0648\u0642\u0641 \u0633\u0631\u0648\u0631", () => {
       void this.toggleServer();
@@ -21835,6 +22290,18 @@ var VaultSSHPlugin = class extends import_obsidian3.Plugin {
         new SessionsModal(this.app, this).open();
       }
     });
+    this.addCommand({
+      id: "vssh-copy-ai-prompt",
+      name: "\u06A9\u067E\u06CC \u067E\u0631\u0627\u0645\u067E\u062A \u0627\u062A\u0635\u0627\u0644 \u0628\u0631\u0627\u06CC \u0647\u0648\u0634 \u0645\u0635\u0646\u0648\u0639\u06CC (Copy AI prompt)",
+      callback: async () => {
+        try {
+          await navigator.clipboard.writeText(this.aiPrompt("local"));
+          new import_obsidian3.Notice("\u067E\u0631\u0627\u0645\u067E\u062A \u0627\u062A\u0635\u0627\u0644 \u06A9\u067E\u06CC \u0634\u062F \u2014 \u0628\u0647 \u0647\u0648\u0634 \u0645\u0635\u0646\u0648\u0639\u06CC \u062E\u0648\u062F \u0628\u062F\u0647\u06CC\u062F.");
+        } catch {
+          new ConnectionInfoModal(this.app, this).open();
+        }
+      }
+    });
     if (this.settings.startWithObsidian) {
       await this.startServer(true);
     }
@@ -21842,6 +22309,7 @@ var VaultSSHPlugin = class extends import_obsidian3.Plugin {
   }
   onunload() {
     void this.server?.stop();
+    void this.tunnel?.stop();
   }
   pushLog(text) {
     this.logEntries.push({ time: Date.now(), text });
@@ -21855,6 +22323,9 @@ var VaultSSHPlugin = class extends import_obsidian3.Plugin {
       if (!quiet) {
         new import_obsidian3.Notice(`SSH \u0633\u0631\u0648\u0631 \u0641\u0639\u0627\u0644 \u0634\u062F \u2192 ${this.settings.bindAddress}:${this.settings.port}`, 6e3);
       }
+      if (this.settings.tunnelMode !== "off") {
+        void this.tunnel.start(this.settings.tunnelMode, this.settings.port, this.settings.tunnelCustom);
+      }
       this.updateStatusBar();
       return true;
     } catch (e) {
@@ -21865,9 +22336,39 @@ var VaultSSHPlugin = class extends import_obsidian3.Plugin {
     }
   }
   async stopServer(quiet = false) {
+    await this.tunnel.stop();
     await this.server.stop();
     if (!quiet) new import_obsidian3.Notice("\u0633\u0631\u0648\u0631 SSH \u0645\u062A\u0648\u0642\u0641 \u0634\u062F.");
     this.updateStatusBar();
+  }
+  /** (Re)start or stop the public tunnel according to current settings. */
+  async applyTunnel() {
+    if (!this.server.isRunning() || this.settings.tunnelMode === "off") {
+      await this.tunnel.stop();
+      return;
+    }
+    await this.tunnel.start(this.settings.tunnelMode, this.settings.port, this.settings.tunnelCustom);
+  }
+  /** Fetch the machine's public (internet) IP, cached for 10 minutes. */
+  async fetchPublicIP(force = false) {
+    const now = Date.now();
+    if (!force && this.publicIPCache.value && now - this.publicIPCache.at < 10 * 6e4) {
+      return this.publicIPCache.value;
+    }
+    const urls = ["https://api.ipify.org", "https://ifconfig.me/ip"];
+    for (const url of urls) {
+      try {
+        const res = await (0, import_obsidian3.requestUrl)({ url, method: "GET", throw: false });
+        const raw = res?.text;
+        const text = String(typeof raw === "string" ? raw : raw instanceof Promise ? await raw : "").trim();
+        if (/^\d{1,3}(\.\d{1,3}){3}$/.test(text)) {
+          this.publicIPCache = { value: text, at: now };
+          return text;
+        }
+      } catch {
+      }
+    }
+    return this.publicIPCache.value || "";
   }
   async toggleServer() {
     if (this.server.isRunning()) await this.stopServer();
@@ -21877,9 +22378,36 @@ var VaultSSHPlugin = class extends import_obsidian3.Plugin {
     if (!this.statusEl) return;
     const running = this.server?.isRunning?.() ?? false;
     const n = running ? this.server.sessionCount : 0;
-    this.statusEl.textContent = running ? `\u2B24 SSH:${this.settings.port}${n > 0 ? ` (${n})` : ""}` : "\u2B58 SSH:off";
+    const tunnelUp = this.tunnel?.isActive?.() ?? false;
+    this.statusEl.textContent = running ? `\u2B24 SSH:${this.settings.port}${n > 0 ? ` (${n})` : ""}${tunnelUp ? " \u2197" : ""}` : "\u2B58 SSH:off";
     if (running) this.statusEl.addClass("vssh-status-on");
     else this.statusEl.removeClass("vssh-status-on");
+  }
+  /** connection scopes for the connection-info modal / AI prompt. */
+  endpointFor(scope) {
+    if (scope === "tunnel") {
+      const st = this.tunnel?.state;
+      if (st?.status === "active" && st.host) return { host: st.host, port: st.port, ready: true, hint: "" };
+      return {
+        host: "",
+        port: 0,
+        ready: false,
+        hint: "\u062A\u0648\u0646\u0644 \u0639\u0645\u0648\u0645\u06CC \u0641\u0639\u0627\u0644 \u0646\u06CC\u0633\u062A \u2014 \u0627\u0632 \u062A\u0646\u0638\u06CC\u0645\u0627\u062A \u0631\u0648\u0634\u0646\u0634 \u06A9\u0646\u06CC\u062F \u06CC\u0627 \u062F\u06A9\u0645\u0647\u200C\u06CC \xAB\u0634\u0631\u0648\u0639 \u062A\u0648\u0646\u0644\xBB \u0631\u0627 \u0628\u0632\u0646\u06CC\u062F."
+      };
+    }
+    if (scope === "lan") {
+      const ip = bestLanIPv4();
+      if (this.settings.bindAddress !== "0.0.0.0") {
+        return {
+          host: ip || "<LAN-IP>",
+          port: this.settings.port,
+          ready: false,
+          hint: "\u0628\u0631\u0627\u06CC \u0627\u062A\u0635\u0627\u0644 \u0627\u0632 \u062F\u0633\u062A\u06AF\u0627\u0647 \u062F\u06CC\u06AF\u0631\u060C \xAB\u062F\u0627\u0645\u0646\u0647\u200C\u06CC \u0627\u062A\u0635\u0627\u0644\xBB \u0631\u0627 \u062F\u0631 \u062A\u0646\u0638\u06CC\u0645\u0627\u062A \u0631\u0648\u06CC \xAB\u0647\u0645\u0647\u200C\u06CC \u0634\u0628\u06A9\u0647\xBB \u0628\u06AF\u0630\u0627\u0631\u06CC\u062F \u0648 \u0633\u0631\u0648\u0631 \u0631\u0627 \u062F\u0648\u0628\u0627\u0631\u0647 \u0634\u0631\u0648\u0639 \u06A9\u0646\u06CC\u062F."
+        };
+      }
+      return { host: ip || "<LAN-IP>", port: this.settings.port, ready: !!ip, hint: ip ? "" : "\u0622\u062F\u0631\u0633 \u0634\u0628\u06A9\u0647\u200C\u06CC \u0645\u062D\u0644\u06CC \u067E\u06CC\u062F\u0627 \u0646\u0634\u062F." };
+    }
+    return { host: "127.0.0.1", port: this.settings.port, ready: true, hint: "" };
   }
   fingerprints() {
     return {
@@ -21888,11 +22416,37 @@ var VaultSSHPlugin = class extends import_obsidian3.Plugin {
     };
   }
   hostDisplay() {
-    return this.settings.bindAddress === "0.0.0.0" ? "<IP-COMPUTER>" : this.settings.bindAddress;
+    if (this.tunnel?.isActive?.() && this.tunnel.state.host) return this.tunnel.state.host;
+    if (this.settings.bindAddress === "0.0.0.0") return bestLanIPv4() || "<LAN-IP>";
+    return this.settings.bindAddress;
   }
   connectionCommand(oneShot = false) {
     const base = `ssh ${this.settings.username}@${this.hostDisplay()} -p ${this.settings.port}`;
     return oneShot ? base + ' "ls"' : base;
+  }
+  /** Ready-to-paste prompt that gives an external AI everything it needs. */
+  aiPrompt(scope = "local") {
+    const ep = this.endpointFor(scope);
+    const s = this.settings;
+    const lines = [
+      "\u0645\u06CC\u200C\u062E\u0648\u0627\u0647\u0645 \u0627\u0632 \u0637\u0631\u06CC\u0642 SSH \u0628\u0647 \u062E\u0632\u0627\u0646\u0647\u200C\u06CC \u0627\u0648\u0628\u0633\u06CC\u062F\u06CC\u0646 \u0645\u0646 \u0648\u0635\u0644 \u0634\u0648\u06CC \u0648 \u06A9\u0627\u0631\u06CC \u0631\u0627 \u0627\u0646\u062C\u0627\u0645 \u062F\u0647\u06CC.",
+      "",
+      `\u0641\u0631\u0645\u0627\u0646 \u0627\u062A\u0635\u0627\u0644 (\u062A\u06A9\u200C\u0641\u0631\u0645\u0627\u0646\u06CC): ssh ${s.username}@${ep.host} -p ${ep.port} "<COMMAND>"`,
+      `\u0646\u0645\u0648\u0646\u0647: ssh ${s.username}@${ep.host} -p ${ep.port} "ls"`,
+      "",
+      `\u0646\u0627\u0645 \u06A9\u0627\u0631\u0628\u0631\u06CC: ${s.username}`,
+      `\u0631\u0645\u0632 \u0639\u0628\u0648\u0631: ${s.password}`,
+      "",
+      "\u0642\u0648\u0627\u0646\u06CC\u0646:",
+      "\u06F1) \u0627\u0628\u062A\u062F\u0627 \u0628\u0627 \u062F\u0633\u062A\u0648\u0631 rules \u0642\u0648\u0627\u0646\u06CC\u0646 \u0633\u0631\u0648\u0631 \u0631\u0627 \u0628\u062E\u0648\u0627\u0646 \u0648 \u0628\u0627 help \u0644\u06CC\u0633\u062A \u062F\u0633\u062A\u0648\u0631\u0627\u062A \u0645\u062C\u0627\u0632 \u0631\u0627 \u0628\u0628\u06CC\u0646.",
+      "\u06F2) \u0641\u0642\u0637 \u0627\u0632 \u062F\u0633\u062A\u0648\u0631\u0627\u062A \u062E\u0648\u062F \u0627\u06CC\u0646 \u0633\u0631\u0648\u0631 \u0627\u0633\u062A\u0641\u0627\u062F\u0647 \u06A9\u0646:",
+      "   ls, cd, pwd, cat, head, tail, write, append, mkdir, rm, mv, cp, find, grep, tree, recent, stat, info",
+      "\u06F3) \u067E\u06CC\u0634 \u0627\u0632 \u0628\u0627\u0632\u0646\u0648\u06CC\u0633\u06CC \u0647\u0631 \u0641\u0627\u06CC\u0644\u060C \u0627\u0648\u0644 \u0645\u062D\u062A\u0648\u0627\u06CC \u0641\u0639\u0644\u06CC\u200C\u0627\u0634 \u0631\u0627 \u0628\u0627 cat \u0628\u062E\u0648\u0627\u0646.",
+      "\u06F4) \u062F\u0633\u062A\u0631\u0633\u06CC \u0641\u0642\u0637 \u062F\u0627\u062E\u0644 \u062E\u0632\u0627\u0646\u0647 \u0627\u0633\u062A\u061B \u062F\u0633\u062A\u0648\u0631 \u0633\u06CC\u0633\u062A\u0645\u200C\u0639\u0627\u0645\u0644\u06CC (\u0645\u062B\u0644 bash) \u06A9\u0627\u0631 \u0646\u0645\u06CC\u200C\u06A9\u0646\u062F.",
+      "\u06F5) \u0628\u0631\u0627\u06CC \u0633\u0627\u062E\u062A \u0641\u0627\u06CC\u0644 \u0627\u0632 write \u0648 \u0628\u0631\u0627\u06CC \u0627\u0641\u0632\u0648\u062F\u0646 \u0627\u0632 append \u0627\u0633\u062A\u0641\u0627\u062F\u0647 \u06A9\u0646\u061B \u062F\u0631 \u0645\u062A\u0646\u200C\u0647\u0627 \u0627\u0632 \\n \u0628\u0631\u0627\u06CC \u062E\u0637 \u062C\u062F\u06CC\u062F \u0627\u0633\u062A\u0641\u0627\u062F\u0647 \u06A9\u0646."
+    ];
+    if (!ep.ready && ep.hint) lines.push("", "\u062A\u0648\u062C\u0647: " + ep.hint);
+    return lines.join("\n");
   }
   async savePluginData() {
     await this.saveData({ settings: this.settings, hostKeys: this.hostKeys });

@@ -39,6 +39,11 @@ export class VaultSSHServer {
   private server: Server | null = null;
   private sessions = new Map<number, InternalSession>();
   private nextId = 1;
+  /** failed-login tracking per IP (10 min sliding window). */
+  private failCounts = new Map<string, { count: number; first: number }>();
+  /** banned IPs (value = ban expiry epoch ms). */
+  private banUntil = new Map<string, number>();
+  private nextSweep = 0;
 
   constructor(
     private getSettings: () => VaultSSHSettings,
@@ -155,6 +160,69 @@ export class VaultSSHServer {
     return n;
   }
 
+  /** Number of currently banned IPs (for the status UI). */
+  get banCount(): number {
+    return this.banUntil.size;
+  }
+
+  /* ---------------- brute-force guard ---------------- */
+
+  private sweepGuards(now: number): void {
+    if (now < this.nextSweep) return;
+    this.nextSweep = now + 30_000;
+    for (const [ip, until] of this.banUntil) {
+      if (until <= now) this.banUntil.delete(ip);
+    }
+    for (const [ip, rec] of this.failCounts) {
+      if (now - rec.first > 10 * 60_000) this.failCounts.delete(ip);
+    }
+  }
+
+  private banRemainingMs(ip: string): number {
+    const until = this.banUntil.get(ip) ?? 0;
+    return until > Date.now() ? until - Date.now() : 0;
+  }
+
+  private noteAuthFail(ip: string): void {
+    const s = this.getSettings();
+    if (!s.bruteforceProtect) return;
+    const now = Date.now();
+    this.sweepGuards(now);
+    const rec = this.failCounts.get(ip) ?? { count: 0, first: now };
+    if (now - rec.first > 10 * 60_000) {
+      rec.count = 0;
+      rec.first = now;
+    }
+    rec.count++;
+    this.failCounts.set(ip, rec);
+    const threshold = Math.max(2, s.maxAuthFails);
+    if (rec.count >= threshold) {
+      const mins = Math.max(1, s.banMinutes);
+      this.banUntil.set(ip, now + mins * 60_000);
+      this.failCounts.delete(ip);
+      this.hooks.log(`brute-force guard: ${ip} banned for ${mins} min (${rec.count} failed logins)`);
+      this.hooks.notify(`IP ${ip} به مدت ${mins} دقیقه مسدود شد (${rec.count} تلاش ناموفق ورود).`);
+    }
+  }
+
+  /** IPs currently banned (ip -> remaining ms) for display. */
+  listBans(): { ip: string; remainingMs: number }[] {
+    const now = Date.now();
+    this.sweepGuards(now);
+    return [...this.banUntil.entries()]
+      .filter(([, until]) => until > now)
+      .map(([ip, until]) => ({ ip, remainingMs: until - now }))
+      .sort((a, b) => b.remainingMs - a.remainingMs);
+  }
+
+  clearBans(): number {
+    const n = this.banUntil.size;
+    this.banUntil.clear();
+    this.failCounts.clear();
+    if (n > 0) this.hooks.log(`all bans cleared (${n})`);
+    return n;
+  }
+
   /* ---------------- internals ---------------- */
 
   private register(kind: 'pty' | 'exec', ip: string, conn: Connection): InternalSession {
@@ -183,6 +251,17 @@ export class VaultSSHServer {
   private onClient(client: Connection): void {
     const ip = ((client as unknown as { _sock?: { remoteAddress?: string } })._sock?.remoteAddress as string) || 'unknown';
     let attempts = 0;
+    this.sweepGuards(Date.now());
+    const bannedFor = this.banRemainingMs(ip);
+    if (bannedFor > 0) {
+      this.hooks.log(`connection from banned ${ip} — dropped (${Math.ceil(bannedFor / 1000)}s left)`);
+      try {
+        client.end();
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
     this.hooks.log(`connection from ${ip}`);
 
     client.on('authentication', (ctx: any) => {
@@ -195,6 +274,7 @@ export class VaultSSHServer {
       };
       if (authMethod === 'password') {
         if (check(String(ctx.password ?? ''))) {
+          this.failCounts.delete(ip);
           this.hooks.log(`auth ok: ${ctx.username}@${ip}`);
           ctx.accept();
         } else {
@@ -205,6 +285,7 @@ export class VaultSSHServer {
           const first = Array.isArray(answers) ? answers?.[0] : undefined;
           const pass = typeof first === 'object' && first !== null ? String(first.response ?? '') : String(first ?? '');
           if (check(pass)) {
+            this.failCounts.delete(ip);
             this.hooks.log(`auth ok (keyboard-interactive): ${ctx.username}@${ip}`);
             ctx.accept();
           } else {
@@ -272,6 +353,7 @@ export class VaultSSHServer {
   private failAuth(ctx: any, client: Connection, ip: string, attempt: number): void {
     const n = attempt + 1;
     this.hooks.log(`auth failed (${n}): ${ctx.username ?? '?'}@${ip}`);
+    this.noteAuthFail(ip);
     try {
       ctx.reject(['password']);
     } catch {

@@ -29,7 +29,7 @@ function check(name, cond, extra) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function connect(user, password) {
+function connectTo(port, user, password) {
   return new Promise((resolve, reject) => {
     const conn = new Client();
     const to = setTimeout(() => {
@@ -46,12 +46,16 @@ function connect(user, password) {
     });
     conn.connect({
       host: '127.0.0.1',
-      port: PORT,
+      port,
       username: user,
       password,
       readyTimeout: 7000,
     });
   });
+}
+
+function connect(user, password) {
+  return connectTo(PORT, user, password);
 }
 
 function exec(conn, cmd) {
@@ -99,6 +103,26 @@ async function main() {
   );
   await server.start();
   console.log(`SSH server up on 127.0.0.1:${PORT}`);
+
+  console.log('--- netinfo / tunnel parsers ---');
+  const pinggyOut = 'Connecting...\n  Tcp URL  : tcp://abc-xyz.a.pinggy.io:43210\nForwarding started';
+  const ep1 = core.parseTunnelEndpoint(pinggyOut, PORT);
+  check('parse pinggy endpoint', !!ep1 && ep1.host === 'abc-xyz.a.pinggy.io' && ep1.port === 43210, JSON.stringify(ep1));
+  const ep2 = core.parseTunnelEndpoint('Warning: Permanently added...\nForwarding TCP connections to serveo.net:52812', PORT);
+  check('parse serveo endpoint', !!ep2 && ep2.host === 'serveo.net' && ep2.port === 52812, JSON.stringify(ep2));
+  const ep3 = core.parseTunnelEndpoint('203.0.113.7:45678 ready', PORT);
+  check('parse bare ip endpoint', !!ep3 && ep3.host === '203.0.113.7' && ep3.port === 45678, JSON.stringify(ep3));
+  check('parser ignores loopback', core.parseTunnelEndpoint('127.0.0.1:2222 localhost:2222', PORT) === null);
+  check('parser ignores local port', core.parseTunnelEndpoint('a.pinggy.io:33333', 33333) === null);
+  check('parser rejects garbage', core.parseTunnelEndpoint('no endpoints here') === null);
+  const lan = core.lanIPv4s();
+  check('lanIPv4s returns array', Array.isArray(lan));
+  check('bestLanIPv4 returns string', typeof core.bestLanIPv4() === 'string');
+  const spec = core.buildTunnelSpec('pinggy', 2222);
+  check('tunnel spec pinggy', spec.cmd === 'ssh' && spec.args.includes('a.pinggy.io') && spec.args.some((a) => String(a).includes('127.0.0.1:2222')));
+  const specC = core.buildTunnelSpec('custom', 2222, 'ssh -R 0:127.0.0.1:{PORT} me@my-server.com');
+  check('tunnel spec custom {PORT}', specC.cmd === 'ssh' && specC.args.some((a) => String(a) === '0:127.0.0.1:2222') && specC.args.includes('me@my-server.com'));
+
   console.log('--- auth ---');
 
   // --- authentication ---
@@ -305,6 +329,46 @@ async function main() {
   r = await exec(conn, 'cat welcome.md');
   check('reads still fine when writes disabled', r.out.includes('# Welcome'), r.out);
   settings.allowWrites = true;
+
+  console.log('--- brute-force IP ban (separate server) ---');
+  const BAN_PORT = 2400 + Math.floor(Math.random() * 100);
+  const banSettings = Object.assign({}, settings, {
+    port: BAN_PORT,
+    bruteforceProtect: true,
+    maxAuthFails: 3,
+    banMinutes: 5,
+  });
+  const banServer = new core.VaultSSHServer(
+    () => banSettings,
+    () => keys,
+    vfs,
+    { log: () => {}, notify: () => {}, onSessionsChanged: () => {}, onStatusChanged: () => {} }
+  );
+  await banServer.start();
+  for (let i = 0; i < 3; i++) {
+    try {
+      await connectTo(BAN_PORT, 'ai', 'wrong-' + i);
+    } catch {
+      /* expected */
+    }
+  }
+  await sleep(200);
+  check('ban recorded after repeated failures', banServer.listBans().length === 1, JSON.stringify(banServer.listBans()));
+  let bannedConn = false;
+  try {
+    await connectTo(BAN_PORT, 'ai', 'test-pass-123'); // correct creds must ALSO be refused while banned
+  } catch {
+    bannedConn = true;
+  }
+  check('banned IP refused even with correct password', bannedConn);
+  const cleared = banServer.clearBans();
+  check('clearBans removes bans', cleared === 1);
+  const connAfterClear = await connectTo(BAN_PORT, 'ai', 'test-pass-123');
+  check('connection works after ban cleared', !!connAfterClear);
+  try {
+    connAfterClear.end();
+  } catch {}
+  await banServer.stop();
 
   console.log('--- teardown ---');
   try {

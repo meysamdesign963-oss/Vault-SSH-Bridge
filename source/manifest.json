@@ -1,7 +1,7 @@
 {
   "id": "vault-ssh-bridge",
   "name": "Vault SSH Bridge",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "minAppVersion": "1.4.0",
   "description": "Embedded SSH server inside Obsidian — let AI assistants connect to your vault, read & write notes, sandboxed to the vault only, with username/password and server rules. | سرور SSH داخل اوبسیدین برای اتصال هوش مصنوعی به خزانه، فقط داخل خزانه",
   "author": "Vault SSH Bridge Project",

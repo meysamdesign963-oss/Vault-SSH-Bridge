@@ -6,6 +6,7 @@ import { App, Notice, PluginSettingTab, Setting } from 'obsidian';
 import type VaultSSHPlugin from './main';
 import { randomPassword } from './main';
 import { ConnectionInfoModal, SessionsModal } from './modals';
+import { VaultSSHSettings } from './types';
 
 export class VaultSSHSettingTab extends PluginSettingTab {
   plugin: VaultSSHPlugin;
@@ -59,11 +60,11 @@ export class VaultSSHSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('دامنه‌ی اتصال')
-      .setDesc('«فقط همین کامپیوتر» امن‌ترین حالت است. «همه‌ی شبکه» فقط اگر دستگاه دیگری (مثلاً گوشی یا سرور هوش مصنوعی) قرار است وصل شود و رمز قوی گذاشته‌اید.')
+      .setDesc('«فقط همین کامپیوتر» برای هوش مصنوعی روی همین سیستم کافی است. «همه‌ی شبکه» برای اتصال از گوشی/لپ‌تاپ دیگر (آی‌پی مثل 192.168.x.x). برای اینترنت از بخش «تونل عمومی» استفاده کنید.')
       .addDropdown((d) =>
         d
           .addOption('127.0.0.1', 'فقط همین کامپیوتر (localhost) — پیشنهادی')
-          .addOption('0.0.0.0', 'همه‌ی شبکه (کمتر امن)')
+          .addOption('0.0.0.0', 'همه‌ی شبکه (اتصال از دستگاه دیگر)')
           .setValue(this.plugin.settings.bindAddress === '0.0.0.0' ? '0.0.0.0' : '127.0.0.1')
           .onChange(async (v) => {
             this.plugin.settings.bindAddress = v;
@@ -73,6 +74,80 @@ export class VaultSSHSettingTab extends PluginSettingTab {
             }
           })
       );
+
+    /* ---------- external access (LAN / internet) ---------- */
+    containerEl.createEl('h3', { text: 'دسترسی خارجی (شبکه / اینترنت)' });
+
+    new Setting(containerEl)
+      .setName('تونل عمومی برای اینترنت')
+      .setDesc('برای اینکه هوش مصنوعیِ بیرون از شبکه (روی سرور اینترنتی) بتواند وصل شود. تونل با کلاینت OpenSSH سیستم ساخته می‌شود و بدون تنظیم مودم کار می‌کند. سرویس رایگان pinggy.io حدود ۶۰ دقیقه فعال می‌ماند.')
+      .addDropdown((d) =>
+        d
+          .addOption('off', 'خاموش')
+          .addOption('pinggy', 'pinggy.io (رایگان — پیشنهادی)')
+          .addOption('serveo', 'serveo.net')
+          .addOption('custom', 'دستور سفارشی')
+          .setValue(this.plugin.settings.tunnelMode)
+          .onChange(async (v) => {
+            this.plugin.settings.tunnelMode = v as VaultSSHSettings['tunnelMode'];
+            await this.plugin.savePluginData();
+            await this.plugin.applyTunnel();
+            this.display();
+          })
+      );
+
+    if (this.plugin.settings.tunnelMode === 'custom') {
+      new Setting(containerEl)
+        .setName('دستور سفارشی تونل')
+        .setDesc('مثال: ssh -R 0:127.0.0.1:{PORT} user@your-server.com  — {PORT} با پورت سرور جایگزین می‌شود.')
+        .addText((t) =>
+          t.setValue(this.plugin.settings.tunnelCustom).onChange(async (v) => {
+            this.plugin.settings.tunnelCustom = v;
+            await this.plugin.savePluginData();
+          })
+        );
+    }
+
+    const tunnelStatus = new Setting(containerEl).setName('وضعیت تونل');
+    const ts = this.plugin.tunnel?.state;
+    tunnelStatus.setDesc(
+      ts?.status === 'active'
+        ? `فعال ✅ ssh -p ${ts.port} ${this.plugin.settings.username}@${ts.host}`
+        : ts?.status === 'starting'
+        ? 'در حال اتصال به سرویس تونل… (چند ثانیه صبر کنید)'
+        : ts?.status === 'error'
+        ? 'خطا: ' + ts.error
+        : 'خاموش — با انتخاب سرویس بالا، تونل خودکار با سرور شروع می‌شود.'
+    );
+    tunnelStatus.addButton((b) =>
+      b.setButtonText('شروع تونل').onClick(async () => {
+        if (this.plugin.settings.tunnelMode === 'off') {
+          new Notice('اول سرویس تونل را انتخاب کنید.');
+          return;
+        }
+        if (!this.plugin.server.isRunning()) await this.plugin.startServer();
+        await this.plugin.tunnel.start(this.plugin.settings.tunnelMode, this.plugin.settings.port, this.plugin.settings.tunnelCustom);
+        this.display();
+      })
+    );
+    tunnelStatus.addButton((b) =>
+      b.setButtonText('توقف تونل').onClick(async () => {
+        await this.plugin.tunnel.stop();
+        this.display();
+      })
+    );
+    if (ts?.status === 'active' && ts.host) {
+      tunnelStatus.addButton((b) =>
+        b.setButtonText('کپی نشانی').onClick(async () => {
+          try {
+            await navigator.clipboard.writeText(`ssh -p ${ts.port} ${this.plugin.settings.username}@${ts.host}`);
+            new Notice('نشانی عمومی کپی شد.');
+          } catch {
+            new Notice('کپی ممکن نشد.');
+          }
+        })
+      );
+    }
 
     /* ---------- auth ---------- */
     containerEl.createEl('h3', { text: 'احراز هویت' });
@@ -231,6 +306,54 @@ export class VaultSSHSettingTab extends PluginSettingTab {
           this.plugin.settings.protectedPaths = v;
           await this.plugin.savePluginData();
         })
+      );
+
+    new Setting(containerEl)
+      .setName('محافظت در برابر حمله‌ی رمز')
+      .setDesc('اگر یک IP چند بار رمز اشتباه بزند، موقتاً مسدود می‌شود. مخصوصاً وقتی سرور روی «همه‌ی شبکه» یا تونل عمومی است، روشن بماند.')
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.bruteforceProtect).onChange(async (v) => {
+          this.plugin.settings.bruteforceProtect = v;
+          await this.plugin.savePluginData();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName('حد تلاش ناموفق برای مسدودی')
+      .setDesc('چند تلاش ناموفق ورود از یک IP (در ۱۰ دقیقه) باعث مسدودی موقت شود. (پیش‌فرض: 5)')
+      .addText((t) => {
+        t.inputEl.type = 'number';
+        t.setValue(String(this.plugin.settings.maxAuthFails));
+        t.onChange(async (v) => {
+          const n = parseInt(v, 10);
+          if (!isNaN(n) && n >= 2 && n <= 50) {
+            this.plugin.settings.maxAuthFails = n;
+            await this.plugin.savePluginData();
+          }
+        });
+      });
+
+    new Setting(containerEl)
+      .setName('مدت مسدودی IP (دقیقه)')
+      .setDesc('مدت زمان مسدود بودن یک IP متخلف. (پیش‌فرض: 10)')
+      .addText((t) => {
+        t.inputEl.type = 'number';
+        t.setValue(String(this.plugin.settings.banMinutes));
+        t.onChange(async (v) => {
+          const n = parseInt(v, 10);
+          if (!isNaN(n) && n >= 1 && n <= 1440) {
+            this.plugin.settings.banMinutes = n;
+            await this.plugin.savePluginData();
+          }
+        });
+      });
+
+    new Setting(containerEl)
+      .setName('مسدودی‌های فعال')
+      .setDesc(
+        this.plugin.server.listBans().length > 0
+          ? this.plugin.server.listBans().length + ' IP مسدود شده — از «نشست‌های فعال» قابل رفع است.'
+          : 'هیچ IP مسدودی وجود ندارد.'
       );
 
     new Setting(containerEl)
