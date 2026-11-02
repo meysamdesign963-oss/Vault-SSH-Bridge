@@ -1,0 +1,64 @@
+/* Vault SSH Bridge — small UI helpers */
+
+.vssh-status-box {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  margin-bottom: 12px;
+  background: var(--background-secondary);
+}
+
+.vssh-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+
+.vssh-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  display: inline-block;
+}
+
+.vssh-dot.on {
+  background: var(--text-success);
+  box-shadow: 0 0 6px var(--text-success);
+}
+
+.vssh-actions {
+  display: inline-flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.vssh-wide {
+  width: 100%;
+  min-width: 100%;
+}
+
+.vssh-mono {
+  font-family: var(--font-monospace);
+}
+
+.vssh-log pre {
+  max-height: 220px;
+  overflow: auto;
+  font-size: 12px;
+  background: var(--background-secondary);
+  padding: 8px;
+  border-radius: 6px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.status-bar-item.vssh-status-on {
+  color: var(--text-success);
+  cursor: pointer;
+}
